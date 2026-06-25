@@ -20,6 +20,15 @@ For each distinct piece of information worth remembering, output a JSON object w
 
 Output ONLY a JSON array of memory entries. No explanation. No markdown code fences.`
 
+const reconcileSystemPrompt = `You are a memory management assistant. Your task is to merge an existing memory file with new information into a single coherent, deduplicated profile.
+
+Rules:
+- Preserve ALL unique facts from both the existing content and the new entry.
+- Remove redundant or duplicate information — do not repeat the same fact twice.
+- Write in clear, readable markdown. Use headers and bullet points where appropriate.
+- Do NOT include YAML frontmatter — output only the markdown body.
+- Do NOT add any preamble or explanation — output only the merged markdown body.`
+
 type Client struct {
 	ac anthropic.Client
 }
@@ -53,6 +62,32 @@ func (c *Client) ExtractMemories(ctx context.Context, transcript string) ([]mode
 		return nil, fmt.Errorf("parse llm output: %w\n\nraw: %s", err, raw)
 	}
 	return entries, nil
+}
+
+// ReconcileMemory calls the LLM to merge existingContent (the full .md file)
+// with the new entry into a single coherent markdown body (no frontmatter).
+func (c *Client) ReconcileMemory(ctx context.Context, existingContent string, entry models.MemoryEntry, transcriptID string) (string, error) {
+	userMsg := fmt.Sprintf(
+		"Existing memory file content:\n\n%s\n\n---\n\nNew information to incorporate (from transcript %s):\n\n%s",
+		existingContent, transcriptID, entry.Content,
+	)
+
+	msg, err := c.ac.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaudeOpus4_8,
+		MaxTokens: 4096,
+		System: []anthropic.TextBlockParam{
+			{Text: reconcileSystemPrompt},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(userMsg)),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("claude api reconcile: %w", err)
+	}
+
+	body := strings.TrimSpace(extractText(msg))
+	return body, nil
 }
 
 func extractText(msg *anthropic.Message) string {

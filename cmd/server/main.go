@@ -41,8 +41,8 @@ func main() {
 	}
 
 	transcriptStore := db.NewTranscriptStore(conn)
-	memStore := memstore.NewStore(objClient)
 	llmClient := llm.New()
+	memStore := memstore.NewStore(objClient, llmClient)
 
 	w := worker.New(transcriptStore, llmClient, memStore)
 	ctx, cancel := context.WithCancel(context.Background())

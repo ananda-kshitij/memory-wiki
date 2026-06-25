@@ -4,20 +4,34 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
 	"github.com/Codex-AK/memory-wiki/internal/models"
-	"github.com/Codex-AK/memory-wiki/internal/storage/object"
 	"go.yaml.in/yaml/v3"
 )
 
-type Store struct {
-	obj *object.Client
+// ObjectClient is the interface for object storage operations used by Store.
+type ObjectClient interface {
+	Put(ctx context.Context, key string, data []byte) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	List(ctx context.Context, prefix string) ([]string, error)
+	GrepAll(ctx context.Context, term string) ([]string, error)
 }
 
-func NewStore(obj *object.Client) *Store {
-	return &Store{obj: obj}
+// Reconciler is the interface the Store uses to merge memory content.
+type Reconciler interface {
+	ReconcileMemory(ctx context.Context, existingContent string, entry models.MemoryEntry, transcriptID string) (string, error)
+}
+
+type Store struct {
+	obj ObjectClient
+	llm Reconciler
+}
+
+func NewStore(obj ObjectClient, llm Reconciler) *Store {
+	return &Store{obj: obj, llm: llm}
 }
 
 type frontmatter struct {
@@ -27,6 +41,8 @@ type frontmatter struct {
 }
 
 // Upsert merges a new memory entry into the existing file (or creates it).
+// When the file already exists, it calls the LLM to reconcile the existing
+// content with the new entry into a single coherent, deduplicated body.
 func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcriptID string) error {
 	key := fmt.Sprintf("memories/%s/%s.md", entry.Category, entry.Name)
 
@@ -36,23 +52,35 @@ func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcript
 	}
 
 	var fm frontmatter
-	var bodyLines []string
+	var body string
 
-	if existing != nil {
-		fm, bodyLines = parse(existing)
+	if existing == nil {
+		// New file: use the entry content as the body directly.
+		body = entry.Content
+	} else {
+		// Existing file: ask the LLM to merge the content.
+		fm, _ = parse(existing)
+
+		reconciledBody, reconcileErr := s.llm.ReconcileMemory(ctx, string(existing), entry, transcriptID)
+		if reconcileErr != nil {
+			// Graceful fallback: append rather than fail the entire transcript.
+			log.Printf("ReconcileMemory failed for %s (falling back to append): %v", key, reconcileErr)
+			_, existingLines := parse(existing)
+			fallbackLines := append(existingLines, "", "---", "", entry.Content)
+			body = strings.Join(fallbackLines, "\n")
+		} else {
+			body = reconciledBody
+		}
 	}
 
-	// Merge tags (dedup)
+	// Merge tags (dedup) and update metadata.
 	fm.Tags = mergeTags(fm.Tags, entry.Tags)
 	fm.LastUpdated = time.Now().UTC()
 	if !contains(fm.SourceIDs, transcriptID) {
 		fm.SourceIDs = append(fm.SourceIDs, transcriptID)
 	}
 
-	// Append new content section
-	bodyLines = append(bodyLines, "", "---", "", entry.Content)
-
-	out, err := render(fm, strings.Join(bodyLines, "\n"))
+	out, err := render(fm, body)
 	if err != nil {
 		return err
 	}
