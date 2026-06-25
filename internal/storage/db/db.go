@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     content     TEXT        NOT NULL,
     status      TEXT        NOT NULL DEFAULT 'pending',
     error       TEXT        NOT NULL DEFAULT '',
+    attempts    INTEGER     NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
