@@ -163,8 +163,8 @@ No Anthropic API key is needed for any test — the E2E suite uses a fake LLM cl
 
 ## What I Would Have Done With More Time
 
-**Auth and multi-tenancy.** There's no auth today — all memories are global. A real deployment would scope memories per user or organization with JWT or API key authentication, which would also require schema changes to partition the transcript table and the object storage key namespace.
+**Auth and multi-tenancy.** There's no auth today, all memories are global. A real deployment would scope memories per user or organization with JWT or API key authentication, which would also require schema changes to partition the transcript table and the object storage key namespace.
 
 **Streaming LLM responses.** For long transcripts, the current blocking `Messages.New` call holds the worker goroutine until the full response arrives. Switching to the streaming API would allow earlier error detection and make it practical to surface incremental progress on the transcript status endpoint.
 
-**Rate limiting and observability.** The ingest endpoint has no rate limiting, which makes it trivial to exhaust the Anthropic API quota. On the observability side there's no structured logging, no Prometheus metrics, and no distributed tracing — all of which would be table stakes before running this in production.
+**Rate limiting and observability.** The ingest endpoint has no rate limiting, which makes it trivial to exhaust the Anthropic API quota. On the observability side there's no structured logging, no Prometheus metrics, and no distributed tracing, all of which would be prerequisites before putting this into production.
