@@ -9,7 +9,7 @@ POST /transcripts
        │
        ▼
   [PostgreSQL]  ← status: pending → processing → done | failed
-       │
+       │              attempts counter + retry_after (exponential backoff)
        ▼
   Background worker (polls every 5s, FOR UPDATE SKIP LOCKED)
        │
@@ -17,9 +17,9 @@ POST /transcripts
   Claude API (claude-opus-4-8)
        │  extracts structured memory entries
        ▼
-  MinIO object store
-       └── memories/
-           ├── people/alice.md
+  MinIO object store                     pgvector (optional)
+       └── memories/              ──►    memory_embeddings table
+           ├── people/alice.md           (OpenAI text-embedding-3-small)
            ├── topics/machine-learning.md
            └── projects/phoenix.md
 ```
@@ -40,18 +40,24 @@ source_transcript_ids: [uuid1, uuid2]
 
 **Background processing (Option 2 — DB status polling)**: A worker polls for `pending` transcripts using `SELECT ... FOR UPDATE SKIP LOCKED` for safe concurrent processing. Status fields (`pending → processing → done | failed`) make job state inspectable via the GET endpoint without a separate queue infrastructure.
 
+**Retry logic with exponential backoff**: Failed transcripts are re-queued to `pending` up to 3 attempts. Backoff delays are `5s * 2^(attempt-1)` — so 5s after the first failure, 10s after the second, then permanently `failed`. The `retry_after` column prevents workers from picking up a job before the backoff window expires.
+
+**Semantic search (optional)**: On every memory write, an embedding is generated via OpenAI `text-embedding-3-small` (1536 dims) and stored in a `memory_embeddings` pgvector table. `GET /memories/search?q=...&mode=semantic` runs a cosine similarity query instead of a brute-force substring scan. If `OPENAI_API_KEY` is not set, the endpoint silently falls back to keyword search — no configuration required to run the app.
+
 ## Running locally
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - An [Anthropic API key](https://console.anthropic.com/)
+- (Optional) An [OpenAI API key](https://platform.openai.com/) — enables semantic search; keyword search is used without it
 
 ### Steps
 
 ```bash
-# 1. Copy env file and add your API key
+# 1. Copy env file and fill in your keys
 cp .env.example .env
-# Edit .env and set ANTHROPIC_API_KEY
+# Required: ANTHROPIC_API_KEY
+# Optional: OPENAI_API_KEY  (enables semantic search)
 
 # 2. Start everything
 docker compose up --build
@@ -71,6 +77,9 @@ curl http://localhost:8080/memories
 curl http://localhost:8080/memories?prefix=people/
 curl http://localhost:8080/memories/people/alice
 curl 'http://localhost:8080/memories/search?q=Stanford'
+
+# Semantic search (requires OPENAI_API_KEY in .env)
+curl 'http://localhost:8080/memories/search?q=machine+learning&mode=semantic'
 ```
 
 ## API Reference
@@ -81,7 +90,7 @@ curl 'http://localhost:8080/memories/search?q=Stanford'
 | GET | `/transcripts/:id` | Poll transcript status |
 | GET | `/memories?prefix=` | List memory files (unix `ls`) |
 | GET | `/memories/:category/:name` | Read a memory file (unix `cat`) |
-| GET | `/memories/search?q=` | Full-text search across all memories (unix `grep`) |
+| GET | `/memories/search?q=&mode=` | Search memories — keyword (default) or `mode=semantic` for vector similarity |
 
 ## Development (without Docker)
 
@@ -96,22 +105,27 @@ go run ./cmd/server
 ## Tech Stack
 
 - **Go** — HTTP server (chi router), worker, business logic
-- **PostgreSQL** — transcript storage and job status tracking
+- **PostgreSQL 16 + pgvector** — transcript storage, job status, and vector embeddings
 - **MinIO** — S3-compatible object store for memory files
-- **Anthropic Claude** (`claude-opus-4-8`) — memory extraction
+- **Anthropic Claude** (`claude-opus-4-8`) — memory extraction and reconciliation
+- **OpenAI** (`text-embedding-3-small`, optional) — semantic search embeddings
+
+## Testing
+
+The project has a three-tier test pyramid:
+
+| Layer | Command | What it tests |
+|---|---|---|
+| Unit | `go test ./internal/...` | Business logic with mocked dependencies — 93.9% coverage on `memory/store` |
+| Integration | `DATABASE_URL=... go test ./tests/integration/...` | `TranscriptStore` against real Postgres — full retry cycle, backoff ordering, `retry_after` gating |
+| E2E | `DATABASE_URL=... MINIO_ENDPOINT=... go test ./tests/e2e/...` | Full pipeline with real Postgres + MinIO; verifies file physically exists in MinIO and DB row reaches `status=done` |
+
+No Anthropic API key is needed for any test — the E2E suite uses a fake LLM client.
 
 ## What I Would Have Done With More Time
-
-**Smarter memory reconciliation.** Right now new transcript content is appended to existing memory files with a `---` separator. A better approach would be to pass the existing file content back to the LLM alongside the new transcript and ask it to produce a single coherent, deduplicated, updated version — rather than accumulating raw sections that grow without bound.
-
-**Retry logic with backoff.** Failed transcripts currently stay in `failed` state permanently. A proper implementation would add an `attempts` counter column, re-queue failed jobs to `pending` up to a configurable limit (e.g. 3), and apply exponential backoff between retries so transient API errors don't silently drop work.
-
-**Semantic search / embeddings.** The current grep endpoint is a brute-force substring scan over every file — it doesn't scale and misses semantically related content that doesn't share exact keywords. With more time I'd generate embeddings for each memory file on write and store them in pgvector, turning the search endpoint into a meaningful similarity query.
 
 **Auth and multi-tenancy.** There's no auth today — all memories are global. A real deployment would scope memories per user or organization with JWT or API key authentication, which would also require schema changes to partition the transcript table and the object storage key namespace.
 
 **Streaming LLM responses.** For long transcripts, the current blocking `Messages.New` call holds the worker goroutine until the full response arrives. Switching to the streaming API would allow earlier error detection and make it practical to surface incremental progress on the transcript status endpoint.
-
-**More test coverage.** The existing unit tests mock storage and the LLM client, which is fast but can't catch integration-level regressions. I'd add tests that run against real Postgres and MinIO (straightforward with `testcontainers-go`), and property-based tests for the YAML frontmatter parse/render round-trip since that's the most error-prone serialization boundary.
 
 **Rate limiting and observability.** The ingest endpoint has no rate limiting, which makes it trivial to exhaust the Anthropic API quota. On the observability side there's no structured logging, no Prometheus metrics, and no distributed tracing — all of which would be table stakes before running this in production.
