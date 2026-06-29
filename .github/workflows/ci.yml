@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: memorywiki
+          POSTGRES_PASSWORD: memorywiki
+          POSTGRES_DB: memorywiki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U memorywiki"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://memorywiki:memorywiki@localhost:5432/memorywiki?sslmode=disable
+      MINIO_ENDPOINT: localhost:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: memories
+      MINIO_USE_SSL: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:9000/minio/health/live && echo "MinIO ready" && break
+            sleep 2
+          done
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        run: go test ./internal/... -coverprofile=cover_unit.out
+
+      - name: Integration tests
+        run: go test ./tests/integration/... -coverprofile=cover_integration.out -coverpkg=./internal/storage/db/...
+
+      - name: E2E tests
+        run: go test ./tests/e2e/... -timeout 60s -coverprofile=cover_e2e.out -coverpkg=./internal/api/handler/...,./internal/memory/...,./internal/storage/...,./internal/worker/...
+
+      - name: Coverage summary
+        run: |
+          echo "mode: set" > cover_merged.out
+          tail -n +2 cover_unit.out >> cover_merged.out
+          tail -n +2 cover_integration.out >> cover_merged.out
+          tail -n +2 cover_e2e.out >> cover_merged.out
+          go tool cover -func=cover_merged.out | tail -1

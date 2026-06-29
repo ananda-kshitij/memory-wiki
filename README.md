@@ -36,13 +36,41 @@ source_transcript_ids: [uuid1, uuid2]
 
 ### Key decisions
 
-**Memory tree (Approach B — topic/category flat files)**: Files grouped by semantic category (`people/`, `topics/`, `projects/`, `events/`, `preferences/`). New transcript insights are _upserted_ into existing files rather than creating new ones per transcript, so memories accumulate over time.
+**Memory storage layout**
 
-**Background processing (Option 2 — DB status polling)**: A worker polls for `pending` transcripts using `SELECT ... FOR UPDATE SKIP LOCKED` for safe concurrent processing. Status fields (`pending → processing → done | failed`) make job state inspectable via the GET endpoint without a separate queue infrastructure.
+Three approaches were considered:
+- **Per-transcript files** — one file per ingested transcript, e.g. `transcripts/2026-06-25-uuid.md`. Simple to write but useless for retrieval: finding everything known about Alice requires scanning every file.
+- **Per-entity files, one file per mention** — a new file for every entity extracted from every transcript. Keeps files small but creates unbounded duplication; Alice across ten conversations becomes ten files with no single source of truth.
+- **Per-entity files, upserted** ✓ — one canonical file per named entity (e.g. `people/alice.md`), updated in place each time a new transcript mentions that entity. Memories accumulate over time in a single, navigable location. This is the approach used.
 
-**Retry logic with exponential backoff**: Failed transcripts are re-queued to `pending` up to 3 attempts. Backoff delays are `5s * 2^(attempt-1)` — so 5s after the first failure, 10s after the second, then permanently `failed`. The `retry_after` column prevents workers from picking up a job before the backoff window expires.
+Files are grouped by semantic category (`people/`, `topics/`, `projects/`, `events/`, `preferences/`) and carry YAML frontmatter (`tags`, `last_updated`, `source_transcript_ids`) so provenance is always traceable.
 
-**Semantic search (optional)**: On every memory write, an embedding is generated via OpenAI `text-embedding-3-small` (1536 dims) and stored in a `memory_embeddings` pgvector table. `GET /memories/search?q=...&mode=semantic` runs a cosine similarity query instead of a brute-force substring scan. If `OPENAI_API_KEY` is not set, the endpoint silently falls back to keyword search — no configuration required to run the app.
+---
+
+**Background processing**
+
+Three options were considered:
+- **Synchronous processing** — process the transcript inline during the POST request and return the result. Simple, but a 10-second LLM call blocks the HTTP connection and makes the API fragile under load.
+- **External message queue (SQS, RabbitMQ, etc.)** — reliable and scalable, but introduces a new infrastructure dependency that complicates local setup and deployment.
+- **DB-backed polling worker** ✓ — a background goroutine polls for `pending` transcripts using `SELECT ... FOR UPDATE SKIP LOCKED`, which prevents two workers from claiming the same job. Status fields (`pending → processing → done | failed`) are queryable via the GET endpoint, so callers can poll progress without a separate notification mechanism. No extra infrastructure beyond Postgres.
+
+---
+
+**Retry logic with exponential backoff**
+
+When an LLM call fails transiently (network error, rate limit, etc.), there are two naive options: fail permanently (loses work silently) or retry immediately in a tight loop (hammers the API). Neither is acceptable.
+
+The chosen approach: failed transcripts are re-queued to `pending` up to 3 attempts with exponential backoff — `5s * 2^(attempt-1)`, so 5s after attempt 1, 10s after attempt 2, then permanently `failed`. A `retry_after` timestamp column prevents workers from picking up the job before the backoff window expires, and the `attempts` counter makes the retry history visible in the GET response.
+
+---
+
+**Semantic search**
+
+Two search approaches were considered:
+- **Keyword scan** — iterate every file in MinIO and check for substring matches. Zero infrastructure cost but O(n) in file count and blind to synonyms or paraphrasing (`"ML researcher"` won't match `"machine learning scientist"`).
+- **Vector similarity search (pgvector)** ✓ — on every memory write, generate an embedding via OpenAI `text-embedding-3-small` (1536 dims) and upsert it into a `memory_embeddings` table. `GET /memories/search?q=...&mode=semantic` runs a cosine similarity query (`<=>` operator) instead of a file scan, returning semantically related results regardless of exact wording.
+
+To keep the app runnable without an OpenAI account, the embedder is optional: if `OPENAI_API_KEY` is not set, semantic mode silently falls back to keyword search.
 
 ## Running locally
 
