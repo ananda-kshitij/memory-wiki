@@ -149,8 +149,6 @@ Every push and pull request runs the full test suite automatically via GitHub Ac
 
 The `main` branch is protected — pull requests can only be merged once the `Test` job is green, ensuring no broken code lands in the main branch.
 
-To enforce this in your own fork: **Settings → Branches → Add branch protection rule** on `main`, enable **"Require status checks to pass before merging"**, and select the `Test` job.
-
 ## Testing
 
 The project has a three-tier test pyramid:
