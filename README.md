@@ -17,7 +17,7 @@ POST /transcripts
   Claude API (claude-opus-4-8)
        │  extracts structured memory entries
        ▼
-  MinIO object store                     pgvector (optional)
+  MinIO object store                     pgvector
        └── memories/              ──►    memory_embeddings table
            ├── people/alice.md           (OpenAI text-embedding-3-small)
            ├── topics/machine-learning.md
@@ -52,7 +52,7 @@ Files are grouped by semantic category (`people/`, `topics/`, `projects/`, `even
 Three options were considered:
 - **Synchronous processing** — process the transcript inline during the POST request and return the result. Simple, but a 10-second LLM call blocks the HTTP connection and makes the API fragile under load.
 - **External message queue (SQS, RabbitMQ, etc.)** — reliable and scalable, but introduces a new infrastructure dependency that complicates local setup and deployment.
-- **DB-backed polling worker** ✓ — a background goroutine polls for `pending` transcripts using `SELECT ... FOR UPDATE SKIP LOCKED`, which prevents two workers from claiming the same job. Status fields (`pending → processing → done | failed`) are queryable via the GET endpoint, so callers can poll progress without a separate notification mechanism. No extra infrastructure beyond Postgres.
+- **DB-backed polling worker** (Selected)  — a background goroutine polls for `pending` transcripts using `SELECT ... FOR UPDATE SKIP LOCKED`, which prevents two workers from claiming the same job. Status fields (`pending → processing → done | failed`) are queryable via the GET endpoint, so callers can poll progress without a separate notification mechanism. No extra infrastructure beyond Postgres.
 
 ---
 
@@ -68,7 +68,7 @@ The chosen approach: failed transcripts are re-queued to `pending` up to 3 attem
 
 Two search approaches were considered:
 - **Keyword scan** — iterate every file in MinIO and check for substring matches. Zero infrastructure cost but O(n) in file count and blind to synonyms or paraphrasing (`"ML researcher"` won't match `"machine learning scientist"`).
-- **Vector similarity search (pgvector)** ✓ — on every memory write, generate an embedding via OpenAI `text-embedding-3-small` (1536 dims) and upsert it into a `memory_embeddings` table. `GET /memories/search?q=...&mode=semantic` runs a cosine similarity query (`<=>` operator) instead of a file scan, returning semantically related results regardless of exact wording.
+- **Vector similarity search (pgvector)** (Selected) — on every memory write, generate an embedding via OpenAI `text-embedding-3-small` (1536 dims) and upsert it into a `memory_embeddings` table. `GET /memories/search?q=...&mode=semantic` runs a cosine similarity query (`<=>` operator) instead of a file scan, returning semantically related results regardless of exact wording.
 
 To keep the app runnable without an OpenAI account, the embedder is optional: if `OPENAI_API_KEY` is not set, semantic mode silently falls back to keyword search.
 
