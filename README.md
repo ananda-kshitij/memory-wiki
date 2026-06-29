@@ -138,6 +138,19 @@ go run ./cmd/server
 - **Anthropic Claude** (`claude-opus-4-8`) — memory extraction and reconciliation
 - **OpenAI** (`text-embedding-3-small`, optional) — semantic search embeddings
 
+## CI/CD
+
+Every push and pull request runs the full test suite automatically via GitHub Actions (`.github/workflows/ci.yml`). The pipeline:
+
+1. Starts Postgres (`pgvector/pgvector:pg16`) and MinIO as ephemeral services
+2. Builds the project (`go build ./...`)
+3. Runs unit → integration → E2E tests in sequence
+4. Prints a combined coverage summary
+
+The `main` branch is protected — pull requests can only be merged once the `Test` job is green, ensuring no broken code lands in the main branch.
+
+To enforce this in your own fork: **Settings → Branches → Add branch protection rule** on `main`, enable **"Require status checks to pass before merging"**, and select the `Test` job.
+
 ## Testing
 
 The project has a three-tier test pyramid:
