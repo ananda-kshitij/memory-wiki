@@ -44,6 +44,14 @@ func main() {
 	llmClient := llm.New()
 	memStore := memstore.NewStore(objClient, llmClient)
 
+	// Attach semantic search if OPENAI_API_KEY is set.
+	if embedder := llm.NewOpenAIEmbedder(); embedder != nil {
+		log.Println("semantic search enabled (OpenAI embeddings + pgvector)")
+		memStore.WithEmbeddings(embedder, db.NewEmbeddingStore(conn))
+	} else {
+		log.Println("semantic search disabled (OPENAI_API_KEY not set; keyword search active)")
+	}
+
 	w := worker.New(transcriptStore, llmClient, memStore)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

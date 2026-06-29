@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/Codex-AK/memory-wiki/internal/memory"
@@ -48,19 +49,25 @@ func (h *MemoryHandler) Cat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	if data == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(data)
 }
 
 // Grep searches all memory files for the given term.
 // GET /memories/search?q=golang
+// GET /memories/search?q=golang&mode=semantic  (uses pgvector similarity when available)
 func (h *MemoryHandler) Grep(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		http.Error(w, "q is required", http.StatusBadRequest)
 		return
 	}
-	matches, err := h.store.Grep(r.Context(), q)
+	semantic := strings.EqualFold(r.URL.Query().Get("mode"), "semantic")
+	matches, err := h.store.Grep(r.Context(), q, semantic)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -73,18 +80,5 @@ func (h *MemoryHandler) Grep(w http.ResponseWriter, r *http.Request) {
 }
 
 func isNotFound(err error) bool {
-	return err != nil && (contains(err.Error(), "NoSuchKey") || contains(err.Error(), "not found"))
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+	return err != nil && (strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found"))
 }

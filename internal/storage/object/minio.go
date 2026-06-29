@@ -54,13 +54,21 @@ func (c *Client) Put(ctx context.Context, key string, data []byte) error {
 }
 
 // Get retrieves the content of an object key.
+// Returns nil, nil when the key does not exist.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	obj, err := c.mc.GetObject(ctx, c.bucket, key, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
 	defer obj.Close()
-	return io.ReadAll(obj)
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+			return nil, fmt.Errorf("NoSuchKey: %s", key)
+		}
+		return nil, err
+	}
+	return data, nil
 }
 
 // List returns all object keys under the given prefix.

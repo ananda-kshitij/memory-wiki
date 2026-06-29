@@ -53,23 +53,36 @@ func (fakeReconciler) ReconcileMemory(_ context.Context, existing string, entry 
 }
 
 // ---------------------------------------------------------------------------
-// E2E test
+// helpers
 // ---------------------------------------------------------------------------
 
-// TestE2ETranscriptToMemory posts a transcript, waits for the worker to
-// process it, then verifies the resulting memory file is visible through the
-// API.
-func TestE2ETranscriptToMemory(t *testing.T) {
+func skipUnlessEnv(t *testing.T) {
+	t.Helper()
 	if os.Getenv("DATABASE_URL") == "" {
 		t.Skip("DATABASE_URL not set; skipping e2e test")
 	}
 	if os.Getenv("MINIO_ENDPOINT") == "" {
 		t.Skip("MINIO_ENDPOINT not set; skipping e2e test")
 	}
+}
 
-	// -----------------------------------------------------------------------
-	// Infrastructure setup
-	// -----------------------------------------------------------------------
+type e2eFixture struct {
+	conn            *db.TranscriptStore
+	objClient       *object.Client
+	memStore        *memstore.Store
+	srv             *httptest.Server
+	rawConn         interface{ Exec(string, ...interface{}) (interface{}, error) }
+}
+
+// ---------------------------------------------------------------------------
+// E2E: full transcript → memory pipeline
+// ---------------------------------------------------------------------------
+
+// TestE2ETranscriptToMemory posts a transcript, waits for the worker to
+// process it, then verifies the resulting memory file is visible through the
+// API and physically present in MinIO.
+func TestE2ETranscriptToMemory(t *testing.T) {
+	skipUnlessEnv(t)
 
 	conn, err := db.Connect()
 	if err != nil {
@@ -89,7 +102,6 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 	transcriptStore := db.NewTranscriptStore(conn)
 	memStore := memstore.NewStore(objClient, fakeReconciler{})
 
-	// Fake LLM produces exactly one memory entry so we can assert it later.
 	fake := &fakeLLM{
 		entries: []models.MemoryEntry{
 			{
@@ -101,20 +113,12 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 		},
 	}
 
-	// -----------------------------------------------------------------------
-	// Worker — runs with a short poll interval to keep the test fast.
-	// -----------------------------------------------------------------------
-
 	w := worker.New(transcriptStore, fake, memStore)
 	w.SetInterval(100 * time.Millisecond)
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	t.Cleanup(stopWorker)
 	go w.Run(workerCtx)
-
-	// -----------------------------------------------------------------------
-	// HTTP server
-	// -----------------------------------------------------------------------
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.Recoverer)
@@ -131,16 +135,9 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 
-	// -----------------------------------------------------------------------
 	// Step 1: POST a transcript.
-	// -----------------------------------------------------------------------
-
 	body := `{"content": "Alice is an engineer who contributed to the e2e test suite."}`
-	resp, err := http.Post(
-		srv.URL+"/transcripts",
-		"application/json",
-		strings.NewReader(body),
-	)
+	resp, err := http.Post(srv.URL+"/transcripts", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST /transcripts: %v", err)
 	}
@@ -159,17 +156,11 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 	}
 	t.Logf("created transcript %s", txResp.ID)
 
-	// Clean up the DB row when the test finishes.
 	t.Cleanup(func() {
-		if _, err := conn.Exec("DELETE FROM transcripts WHERE id = $1", txResp.ID); err != nil {
-			t.Logf("cleanup: delete transcript %s: %v", txResp.ID, err)
-		}
+		conn.Exec("DELETE FROM transcripts WHERE id = $1", txResp.ID)
 	})
 
-	// -----------------------------------------------------------------------
-	// Step 2: Poll GET /transcripts/{id} until status is "done" or timeout.
-	// -----------------------------------------------------------------------
-
+	// Step 2: Poll until status is "done".
 	pollTimeout := 15 * time.Second
 	deadline := time.Now().Add(pollTimeout)
 	var finalStatus models.TranscriptStatus
@@ -179,7 +170,6 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GET /transcripts/%s: %v", txResp.ID, err)
 		}
-
 		var poll models.Transcript
 		_ = json.NewDecoder(r.Body).Decode(&poll)
 		r.Body.Close()
@@ -198,10 +188,9 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 			txResp.ID, finalStatus, models.StatusDone, pollTimeout)
 	}
 
-	// -----------------------------------------------------------------------
-	// Step 3: GET /memories and verify at least one file exists.
-	// -----------------------------------------------------------------------
+	wantKey := "memories/people/e2e-test-subject.md"
 
+	// Step 3: GET /memories and verify the file appears.
 	memResp, err := http.Get(srv.URL + "/memories")
 	if err != nil {
 		t.Fatalf("GET /memories: %v", err)
@@ -222,10 +211,7 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 	if len(files.Files) == 0 {
 		t.Fatal("expected at least one memory file after processing, got none")
 	}
-	t.Logf("memory files: %v", files.Files)
 
-	// Verify the specific file created by the fake LLM is present.
-	wantKey := "memories/people/e2e-test-subject.md"
 	found := false
 	for _, f := range files.Files {
 		if f == wantKey {
@@ -237,10 +223,7 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 		t.Errorf("expected %q in /memories response, got %v", wantKey, files.Files)
 	}
 
-	// -----------------------------------------------------------------------
 	// Step 4: GET /memories/{category}/{name} and verify content.
-	// -----------------------------------------------------------------------
-
 	catResp, err := http.Get(srv.URL + "/memories/people/e2e-test-subject")
 	if err != nil {
 		t.Fatalf("GET /memories/people/e2e-test-subject: %v", err)
@@ -251,10 +234,7 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 		t.Fatalf("GET /memories/people/e2e-test-subject: status %d", catResp.StatusCode)
 	}
 
-	// -----------------------------------------------------------------------
 	// Step 5: GET /memories/search?q=e2e and verify the file shows up.
-	// -----------------------------------------------------------------------
-
 	searchResp, err := http.Get(srv.URL + "/memories/search?q=e2e")
 	if err != nil {
 		t.Fatalf("GET /memories/search: %v", err)
@@ -277,5 +257,119 @@ func TestE2ETranscriptToMemory(t *testing.T) {
 	}
 	if !searchFound {
 		t.Errorf("search for 'e2e' did not return %q; matches: %v", wantKey, searchResult.Matches)
+	}
+
+	// Step 6: Verify the file physically exists in MinIO (object storage).
+	data, err := objClient.Get(context.Background(), wantKey)
+	if err != nil {
+		t.Fatalf("MinIO Get %q: %v — file not found in object storage", wantKey, err)
+	}
+	if len(data) == 0 {
+		t.Error("MinIO file exists but is empty")
+	}
+	content := string(data)
+	if !strings.Contains(content, "e2e-test-subject") && !strings.Contains(content, "automated") {
+		t.Errorf("MinIO file content looks wrong: %q", content)
+	}
+	t.Logf("MinIO object %q verified (%d bytes)", wantKey, len(data))
+
+	// Step 7: Verify the transcript row exists in Postgres with status=done.
+	dbRow, err := db.NewTranscriptStore(conn).GetByID(txResp.ID)
+	if err != nil {
+		t.Fatalf("GetByID from DB: %v", err)
+	}
+	if dbRow == nil {
+		t.Fatal("transcript row not found in Postgres")
+	}
+	if dbRow.Status != models.StatusDone {
+		t.Errorf("DB transcript status: got %q, want done", dbRow.Status)
+	}
+	t.Logf("Postgres row %q verified (status=%s, attempts=%d)", dbRow.ID, dbRow.Status, dbRow.Attempts)
+}
+
+// ---------------------------------------------------------------------------
+// E2E: handler validation
+// ---------------------------------------------------------------------------
+
+func TestPostTranscriptEmptyContent(t *testing.T) {
+	skipUnlessEnv(t)
+
+	conn, err := db.Connect()
+	if err != nil {
+		t.Fatalf("db connect: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	_ = db.Migrate(conn)
+
+	r := chi.NewRouter()
+	th := handler.NewTranscriptHandler(db.NewTranscriptStore(conn))
+	r.Post("/transcripts", th.Create)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	for _, body := range []string{`{"content": ""}`, `{"content": "   "}`, `{}`} {
+		resp, err := http.Post(srv.URL+"/transcripts", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body %q: got status %d, want 400", body, resp.StatusCode)
+		}
+	}
+}
+
+func TestSearchWithoutQuery(t *testing.T) {
+	skipUnlessEnv(t)
+
+	conn, err := db.Connect()
+	if err != nil {
+		t.Fatalf("db connect: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	_ = db.Migrate(conn)
+
+	objClient, err := object.New()
+	if err != nil {
+		t.Fatalf("object store: %v", err)
+	}
+
+	r := chi.NewRouter()
+	mh := handler.NewMemoryHandler(memstore.NewStore(objClient, fakeReconciler{}))
+	r.Get("/memories/search", mh.Grep)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/memories/search")
+	if err != nil {
+		t.Fatalf("GET /memories/search: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("got status %d, want 400 when q is missing", resp.StatusCode)
+	}
+}
+
+func TestCatNotFound(t *testing.T) {
+	skipUnlessEnv(t)
+
+	objClient, err := object.New()
+	if err != nil {
+		t.Fatalf("object store: %v", err)
+	}
+
+	r := chi.NewRouter()
+	mh := handler.NewMemoryHandler(memstore.NewStore(objClient, fakeReconciler{}))
+	r.Get("/memories/{category}/{name}", mh.Cat)
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/memories/people/definitely-does-not-exist")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("got status %d, want 404 for non-existent memory", resp.StatusCode)
 	}
 }

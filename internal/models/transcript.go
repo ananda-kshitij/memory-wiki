@@ -12,11 +12,12 @@ const (
 )
 
 type Transcript struct {
-	ID        string           `json:"id"`
-	Content   string           `json:"content"`
-	Status    TranscriptStatus `json:"status"`
-	Error     string           `json:"error,omitempty"`
-	Attempts  int              `json:"attempts"`
-	CreatedAt time.Time        `json:"created_at"`
-	UpdatedAt time.Time        `json:"updated_at"`
+	ID         string           `json:"id"`
+	Content    string           `json:"content"`
+	Status     TranscriptStatus `json:"status"`
+	Error      string           `json:"error,omitempty"`
+	Attempts   int              `json:"attempts"`
+	RetryAfter *time.Time       `json:"retry_after,omitempty"`
+	CreatedAt  time.Time        `json:"created_at"`
+	UpdatedAt  time.Time        `json:"updated_at"`
 }

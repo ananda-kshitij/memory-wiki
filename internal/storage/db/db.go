@@ -31,10 +31,18 @@ CREATE TABLE IF NOT EXISTS transcripts (
     status      TEXT        NOT NULL DEFAULT 'pending',
     error       TEXT        NOT NULL DEFAULT '',
     attempts    INTEGER     NOT NULL DEFAULT 0,
+    retry_after TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_transcripts_status ON transcripts (status);`
+ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_transcripts_status ON transcripts (status);
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    path        TEXT PRIMARY KEY,
+    embedding   vector(1536),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);`
 	_, err := conn.Exec(query)
 	return err
 }

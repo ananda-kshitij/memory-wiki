@@ -25,13 +25,33 @@ type Reconciler interface {
 	ReconcileMemory(ctx context.Context, existingContent string, entry models.MemoryEntry, transcriptID string) (string, error)
 }
 
+// Embedder converts text to a vector embedding for semantic search.
+type Embedder interface {
+	Embed(ctx context.Context, text string) ([]float32, error)
+}
+
+// EmbeddingStorer persists and queries vector embeddings.
+type EmbeddingStorer interface {
+	Upsert(ctx context.Context, path string, embedding []float32) error
+	Search(ctx context.Context, query []float32, limit int) ([]string, error)
+}
+
 type Store struct {
 	obj ObjectClient
 	llm Reconciler
+	emb Embedder        // nil → semantic search unavailable
+	idx EmbeddingStorer // nil → semantic search unavailable
 }
 
 func NewStore(obj ObjectClient, llm Reconciler) *Store {
 	return &Store{obj: obj, llm: llm}
+}
+
+// WithEmbeddings attaches an embedder and embedding store for semantic search.
+func (s *Store) WithEmbeddings(emb Embedder, idx EmbeddingStorer) *Store {
+	s.emb = emb
+	s.idx = idx
+	return s
 }
 
 type frontmatter struct {
@@ -43,6 +63,7 @@ type frontmatter struct {
 // Upsert merges a new memory entry into the existing file (or creates it).
 // When the file already exists, it calls the LLM to reconcile the existing
 // content with the new entry into a single coherent, deduplicated body.
+// If an embedder is configured, it also stores a vector embedding for the file.
 func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcriptID string) error {
 	key := fmt.Sprintf("memories/%s/%s.md", entry.Category, entry.Name)
 
@@ -55,10 +76,8 @@ func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcript
 	var body string
 
 	if existing == nil {
-		// New file: use the entry content as the body directly.
 		body = entry.Content
 	} else {
-		// Existing file: ask the LLM to merge the content.
 		fm, _ = parse(existing)
 
 		reconciledBody, reconcileErr := s.llm.ReconcileMemory(ctx, string(existing), entry, transcriptID)
@@ -73,7 +92,6 @@ func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcript
 		}
 	}
 
-	// Merge tags (dedup) and update metadata.
 	fm.Tags = mergeTags(fm.Tags, entry.Tags)
 	fm.LastUpdated = time.Now().UTC()
 	if !contains(fm.SourceIDs, transcriptID) {
@@ -85,7 +103,22 @@ func (s *Store) Upsert(ctx context.Context, entry models.MemoryEntry, transcript
 		return err
 	}
 
-	return s.obj.Put(ctx, key, out)
+	if err := s.obj.Put(ctx, key, out); err != nil {
+		return err
+	}
+
+	// Store embedding if configured. Log and continue on failure so a missing
+	// OpenAI key never blocks memory ingestion.
+	if s.emb != nil && s.idx != nil {
+		vec, embErr := s.emb.Embed(ctx, body)
+		if embErr != nil {
+			log.Printf("embed %s: %v (skipping)", key, embErr)
+		} else if idxErr := s.idx.Upsert(ctx, key, vec); idxErr != nil {
+			log.Printf("index embedding %s: %v (skipping)", key, idxErr)
+		}
+	}
+
+	return nil
 }
 
 // List returns all object keys with the given prefix.
@@ -104,8 +137,18 @@ func (s *Store) Cat(ctx context.Context, path string) ([]byte, error) {
 	return s.obj.Get(ctx, path)
 }
 
-// Grep returns keys whose content contains the search term.
-func (s *Store) Grep(ctx context.Context, term string) ([]string, error) {
+// Grep searches memory files for the given term.
+// When semantic=true and an embedder is configured it uses vector similarity;
+// otherwise it falls back to case-insensitive substring scan.
+func (s *Store) Grep(ctx context.Context, term string, semantic bool) ([]string, error) {
+	if semantic && s.emb != nil && s.idx != nil {
+		vec, err := s.emb.Embed(ctx, term)
+		if err != nil {
+			log.Printf("embed query %q: %v (falling back to keyword)", term, err)
+		} else {
+			return s.idx.Search(ctx, vec, 20)
+		}
+	}
 	return s.obj.GrepAll(ctx, term)
 }
 
