@@ -41,7 +41,7 @@ source_transcript_ids: [uuid1, uuid2]
 Three approaches were considered:
 - **Per-transcript files** — one file per ingested transcript, e.g. `transcripts/2026-06-25-uuid.md`. Simple to write but useless for retrieval: finding everything known about Alice requires scanning every file.
 - **Per-entity files, one file per mention** — a new file for every entity extracted from every transcript. Keeps files small but creates unbounded duplication; Alice across ten conversations becomes ten files with no single source of truth.
-- **Per-entity files, upserted** ✓ — one canonical file per named entity (e.g. `people/alice.md`), updated in place each time a new transcript mentions that entity. Memories accumulate over time in a single, navigable location. This is the approach used.
+- **Per-entity files, upserted** (Selected) — one canonical file per named entity (e.g. `people/alice.md`), updated in place each time a new transcript mentions that entity. Memories accumulate over time in a single, navigable location. This is the approach used.
 
 Files are grouped by semantic category (`people/`, `topics/`, `projects/`, `events/`, `preferences/`) and carry YAML frontmatter (`tags`, `last_updated`, `source_transcript_ids`) so provenance is always traceable.
 
